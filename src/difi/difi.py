@@ -1,3 +1,7 @@
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Union
+
 import pyarrow as pa
 import pyarrow.compute as pc
 import quivr as qv
@@ -15,6 +19,21 @@ class PartitionMapping(qv.Table):
 class LinkageMembers(qv.Table):
     linkage_id = qv.LargeStringColumn()
     obs_id = qv.LargeStringColumn()
+
+
+@dataclass
+class DuckDBLinkageInput:
+    """
+    Configuration for providing linkage member data to the DuckDB engine.
+
+    This allows the caller to point DuckDB directly at one or more Parquet
+    files (e.g., THOR cluster/iod member outputs) and specify which columns
+    contain the logical linkage_id and obs_id fields.
+    """
+
+    path: Union[str, Path]
+    linkage_id_column: str
+    obs_id_column: str
 
 
 class AllLinkages(qv.Table):
@@ -508,13 +527,14 @@ def update_all_objects(
 
 
 def analyze_linkages(
-    observations: Observations,
-    linkage_members: LinkageMembers,
+    observations: Union[Observations, str, Path],
+    linkage_members: Union[LinkageMembers, str, Path, DuckDBLinkageInput],
     all_objects: AllObjects,
     partition_summary: PartitionSummary | None = None,
     partition_mapping: PartitionMapping | None = None,
     min_obs: int = 6,
     contamination_percentage: float = 20.0,
+    engine: str = "auto",
 ) -> tuple[AllObjects, AllLinkages, PartitionSummary]:
     """
     Did I Find It?
@@ -530,10 +550,10 @@ def analyze_linkages(
 
     Parameters
     ----------
-    observations : Observations
-        Table of observations.
-    linkage_members : LinkageMembers
-        Table of linkage members.
+    observations : Observations or path-like
+        Table of observations, or a path to a Parquet file/dataset containing them.
+    linkage_members : LinkageMembers or path-like
+        Table of linkage members, or a path to a Parquet file/dataset containing them.
     all_objects : AllObjects
         Table of all objects.
     min_obs : int
@@ -543,6 +563,10 @@ def analyze_linkages(
         Maximum percentage of observations that can belong to a different object
         for a linkage to be considered contaminated. Otherwise, it is considered
         mixed.
+    engine : {"auto", "memory", "duckdb"}, optional
+        Execution engine to use. "memory" retains the original in-memory behavior.
+        "duckdb" uses DuckDB to operate on Parquet data directly; "auto" selects
+        based on input type.
 
     Returns
     -------
@@ -552,18 +576,53 @@ def analyze_linkages(
         Table of all linkages.
     """
 
+    if engine not in {"auto", "memory", "duckdb"}:
+        raise ValueError(f"Unknown engine '{engine}', expected 'auto', 'memory', or 'duckdb'.")
+
+    obs_is_table = isinstance(observations, Observations)
+    lm_is_table = isinstance(linkage_members, LinkageMembers)
+    obs_is_path = isinstance(observations, (str, Path))
+    lm_is_path = isinstance(linkage_members, (str, Path))
+
+    if engine == "auto":
+        # If both inputs are in-memory tables, keep the original behavior.
+        # Otherwise, prefer the DuckDB-backed engine.
+        if obs_is_table and lm_is_table:
+            engine = "memory"
+        else:
+            engine = "duckdb"
+
+    if engine == "duckdb":
+        return _analyze_linkages_duckdb(
+            observations,
+            linkage_members,
+            all_objects,
+            partition_summary=partition_summary,
+            partition_mapping=partition_mapping,
+            min_obs=min_obs,
+            contamination_percentage=contamination_percentage,
+        )
+
+    if not (obs_is_table and lm_is_table):
+        raise TypeError(
+            "analyze_linkages(engine='memory') expects in-memory Observations and LinkageMembers tables."
+        )
+
+    observations_table: Observations = observations
+    linkage_members_table: LinkageMembers = linkage_members
+
     all_linkages = AllLinkages.empty()
     all_objects_updated = AllObjects.empty()
     partition_summaries_updated = PartitionSummary.empty()
 
     # If no partition summary is provided, create a single partition covering all observations
     if partition_summary is None:
-        partitions = Partitions.create_single(observations.night)
-        partition_summary = PartitionSummary.create(observations, partitions)
+        partitions = Partitions.create_single(observations_table.night)
+        partition_summary = PartitionSummary.create(observations_table, partitions)
 
     # If no partition mapping is provided, assume all linkages belong to the single partition
     if partition_mapping is None:
-        linkage_ids_unique = linkage_members.linkage_id.unique()
+        linkage_ids_unique = linkage_members_table.linkage_id.unique()
         partition_mapping = PartitionMapping.from_kwargs(
             linkage_id=linkage_ids_unique,
             partition_id=pa.repeat(partition_summary.id[0], len(linkage_ids_unique)),
@@ -577,15 +636,15 @@ def analyze_linkages(
         partition_id = partition.id[0].as_py()
 
         linkage_ids = partition_mapping.select("partition_id", partition_id).linkage_id
-        linkage_members_partition = linkage_members.apply_mask(
-            pc.is_in(linkage_members.linkage_id, linkage_ids)
+        linkage_members_partition = linkage_members_table.apply_mask(
+            pc.is_in(linkage_members_table.linkage_id, linkage_ids)
         )
 
         # Create the AllLinkages table for this partition
         if len(linkage_members_partition) > 0:
 
             all_linkages_partition = AllLinkages.create(
-                observations,
+                observations_table,
                 partition,
                 linkage_members_partition,
                 min_obs=min_obs,
@@ -600,7 +659,7 @@ def analyze_linkages(
         # Update the AllObjects table for this partition
         all_objects_partition = update_all_objects(
             all_objects.select("partition_id", partition_id),
-            observations,
+            observations_table,
             linkage_members_partition,
             all_linkages,
             min_obs=min_obs,
@@ -660,3 +719,603 @@ def analyze_linkages(
         partition_summaries_updated = qv.concatenate([partition_summaries_updated, partition_summary_updated])
 
     return all_objects_updated, all_linkages, partition_summaries_updated
+
+
+def _analyze_linkages_duckdb(
+    observations: Union[Observations, str, Path],
+    linkage_members: Union[LinkageMembers, str, Path, DuckDBLinkageInput],
+    all_objects: AllObjects,
+    *,
+    partition_summary: Optional[PartitionSummary] = None,
+    partition_mapping: Optional[PartitionMapping] = None,
+    min_obs: int,
+    contamination_percentage: float,
+) -> tuple[AllObjects, AllLinkages, PartitionSummary]:
+    """
+    DuckDB-backed implementation of analyze_linkages.
+
+    This implementation expects observations and linkage_members to be provided
+    as paths to Parquet data when operating on large datasets. For small,
+    in-memory tables it will materialize temporary Parquet files.
+    """
+
+    try:
+        import duckdb  # type: ignore[import]
+    except ImportError as e:  # pragma: no cover - exercised via tests
+        raise ImportError(
+            "DuckDB engine requested, but 'duckdb' is not installed. "
+            "Install the optional extra with 'pip install difi[duckdb]'."
+        ) from e
+
+    # Normalize observations and linkage_members to Parquet paths
+    def _normalize_to_parquet_path(obj: Union[Observations, str, Path], table_name: str) -> str:
+        if isinstance(obj, (str, Path)):
+            return str(obj)
+        # Small in-memory table: write to a temporary Parquet file
+        import tempfile
+        import os
+
+        tmp_dir = tempfile.mkdtemp(prefix="difi_duckdb_")
+        path = os.path.join(tmp_dir, f"{table_name}.parquet")
+        obj.to_parquet(path)
+        return path
+
+    obs_path = _normalize_to_parquet_path(observations, "observations")
+
+    # Linkage members may be provided either as a logical LinkageMembers table/path
+    # (with columns linkage_id/obs_id) or as a DuckDBLinkageInput that points to
+    # arbitrary Parquet with configurable column names (e.g., THOR outputs).
+    if isinstance(linkage_members, DuckDBLinkageInput):
+        lm_path = str(linkage_members.path)
+        lm_linkage_col = linkage_members.linkage_id_column
+        lm_obs_id_col = linkage_members.obs_id_column
+    else:
+        lm_path = _normalize_to_parquet_path(linkage_members, "linkage_members")
+        lm_linkage_col = "linkage_id"
+        lm_obs_id_col = "obs_id"
+
+    # If no partition summary is provided, create one using a small in-memory load
+    if partition_summary is None:
+        # Load only the 'night' column to build a single partition
+        obs_table = Observations.from_parquet(obs_path)
+        partitions = Partitions.create_single(obs_table.night)
+        partition_summary = PartitionSummary.create(obs_table, partitions)
+
+    # Enforce exactly one partition
+    if len(partition_summary) != 1:
+        raise ValueError("analyze_linkages (duckdb) requires exactly one partition in partition_summary")
+
+    partition = partition_summary[0]
+    start_night = partition.start_night[0].as_py()
+    end_night = partition.end_night[0].as_py()
+    partition_id = partition.id[0].as_py()
+
+    # Establish DuckDB connection and register Parquet-backed tables
+    conn = duckdb.connect()
+
+    # DuckDB does not allow parameterized DDL for read_parquet, so we interpolate
+    # the paths directly into the SQL. These paths are constructed by this
+    # function and are not user-controlled.
+    conn.execute(f"CREATE VIEW obs AS SELECT * FROM read_parquet('{obs_path}')")
+    conn.execute(f"CREATE VIEW lm_raw AS SELECT * FROM read_parquet('{lm_path}')")
+    # Project the configured linkage and obs_id columns into a canonical view.
+    conn.execute(
+        f"CREATE VIEW lm AS "
+        f"SELECT {lm_linkage_col} AS linkage_id, {lm_obs_id_col} AS obs_id FROM lm_raw"
+    )
+
+    # If no partition mapping is provided, assume all linkages belong to the single partition.
+    # Use DuckDB to compute the distinct linkage IDs rather than loading all linkage members
+    # into memory.
+    if partition_mapping is None:
+        linkage_ids_arrow = conn.execute(
+            "SELECT DISTINCT linkage_id FROM lm"
+        ).fetch_arrow_table()
+        partition_mapping = PartitionMapping.from_kwargs(
+            linkage_id=linkage_ids_arrow["linkage_id"],
+            partition_id=pa.repeat(partition_id, len(linkage_ids_arrow)),
+        )
+
+    # Restrict linkage_members to those present in the mapping for this partition_id
+    lm_ids = partition_mapping.select("partition_id", partition_id).linkage_id.to_pylist()
+    if not lm_ids:
+        # No linkages for this partition: nothing to classify
+        return AllObjects.empty(), AllLinkages.empty(), partition_summary
+
+    conn.execute(
+        "CREATE TEMP TABLE lm_partition AS "
+        "SELECT * FROM lm WHERE linkage_id IN (SELECT UNNEST(?))",
+        [lm_ids],
+    )
+
+    # linkage_member_associations with outside_partition flag
+    conn.execute(
+        """
+        CREATE TEMP TABLE lma AS
+        SELECT
+            lm.linkage_id,
+            lm.obs_id,
+            obs.object_id,
+            obs.night,
+            (obs.night < ? OR obs.night > ?) AS outside_partition
+        FROM lm_partition AS lm
+        JOIN obs ON lm.obs_id = obs.id
+        """,
+        [start_night, end_night],
+    )
+
+    # Enforce that all linkage members are present in observations
+    missing_count = conn.execute(
+        """
+        SELECT COUNT(*) AS missing
+        FROM (
+            SELECT DISTINCT obs_id FROM lm_partition
+            EXCEPT
+            SELECT DISTINCT id FROM obs
+        ) t
+        """
+    ).fetchone()[0]
+    if missing_count > 0:
+        raise ValueError("All linkage members must be in the observations.")
+
+    # Observation counts per object
+    conn.execute(
+        """
+        CREATE TEMP TABLE observations_per_object AS
+        SELECT object_id, COUNT(id) AS id_count
+        FROM obs
+        GROUP BY object_id
+        """
+    )
+
+    # Unique object members per linkage
+    conn.execute(
+        """
+        CREATE TEMP TABLE unique_object_members AS
+        SELECT
+            linkage_id,
+            COUNT(DISTINCT obs_id) AS num_obs,
+            COUNT(DISTINCT object_id) AS num_members,
+            SUM(CASE WHEN outside_partition THEN 1 ELSE 0 END) AS num_obs_outside_partition
+        FROM lma
+        GROUP BY linkage_id
+        """
+    )
+
+    # Counts per (linkage_id, object_id)
+    conn.execute(
+        """
+        CREATE TEMP TABLE linkage_object_counts AS
+        SELECT
+            linkage_id,
+            object_id,
+            COUNT(*) AS object_id_counts
+        FROM lma
+        GROUP BY linkage_id, object_id
+        """
+    )
+
+    # Best-matching object per linkage (highest fraction of observations)
+    conn.execute(
+        """
+        CREATE TEMP TABLE linkage_best_object AS
+        WITH ranked AS (
+            SELECT
+                loc.linkage_id,
+                loc.object_id,
+                loc.object_id_counts,
+                uom.num_obs,
+                uom.num_members,
+                uom.num_obs_outside_partition,
+                CAST(loc.object_id_counts AS DOUBLE) / CAST(uom.num_obs AS DOUBLE) AS percentage_in_linkage,
+                ROW_NUMBER() OVER (
+                    PARTITION BY loc.linkage_id
+                    ORDER BY CAST(loc.object_id_counts AS DOUBLE) / CAST(uom.num_obs AS DOUBLE) DESC
+                ) AS rn
+            FROM linkage_object_counts AS loc
+            JOIN unique_object_members AS uom USING (linkage_id)
+        )
+        SELECT
+            linkage_id,
+            object_id AS object_id_first,
+            object_id_counts AS object_id_counts_first,
+            percentage_in_linkage AS percentage_in_linkage_first,
+            num_obs,
+            num_members,
+            num_obs_outside_partition
+        FROM ranked
+        WHERE rn = 1
+        """
+    )
+
+    # Build AllLinkages core metrics
+    conn.execute(
+        """
+        CREATE TEMP TABLE all_linkages_core AS
+        SELECT
+            linkage_id,
+            object_id_first,
+            num_obs,
+            num_members,
+            num_obs_outside_partition,
+            object_id_counts_first,
+            percentage_in_linkage_first,
+            ROUND((1.0 - percentage_in_linkage_first) * 100.0, 10) AS contamination
+        FROM linkage_best_object
+        """
+    )
+
+    # Add purity / contamination flags and linked_object_id
+    conn.execute(
+        """
+        CREATE TEMP TABLE all_linkages_flags AS
+        SELECT
+            linkage_id,
+            object_id_first,
+            num_obs,
+            num_members,
+            num_obs_outside_partition,
+            object_id_counts_first,
+            percentage_in_linkage_first,
+            contamination,
+            (contamination = 0.0) AS pure,
+            (contamination > 0.0 AND contamination <= ?) AS contaminated,
+            (contamination <> 0.0 AND NOT (contamination > 0.0 AND contamination <= ?)) AS mixed,
+            CASE
+                WHEN contamination = 0.0
+                     OR (contamination > 0.0 AND contamination <= ?)
+                THEN object_id_first
+                ELSE NULL
+            END AS linked_object_id
+        FROM all_linkages_core
+        """,
+        [contamination_percentage, contamination_percentage, contamination_percentage],
+    )
+
+    # Partition-level counts inside the partition
+    conn.execute(
+        """
+        CREATE TEMP TABLE obs_partition_counts AS
+        SELECT
+            object_id,
+            COUNT(id) AS num_obs_in_partition
+        FROM obs
+        WHERE night BETWEEN ? AND ?
+        GROUP BY object_id
+        """,
+        [start_night, end_night],
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE linkage_obs_partition_counts AS
+        SELECT
+            linkage_id,
+            COUNT(DISTINCT obs_id) AS num_linkage_obs_inside_partition
+        FROM lma
+        WHERE NOT outside_partition
+        GROUP BY linkage_id
+        """
+    )
+
+    # Assemble final AllLinkages table with pure_complete and found flags
+    all_linkages_arrow = conn.execute(
+        """
+        SELECT
+            alf.linkage_id,
+            alf.linked_object_id,
+            alf.num_obs,
+            alf.num_obs_outside_partition,
+            alf.num_members,
+            alf.pure,
+            -- pure_complete
+            (alf.pure AND
+             opc.num_obs_in_partition IS NOT NULL AND
+             opc.num_obs_in_partition = lopc.num_linkage_obs_inside_partition) AS pure_complete,
+            alf.contaminated,
+            alf.contamination,
+            alf.mixed,
+            -- found_pure
+            (alf.pure AND alf.num_obs >= ?) AS found_pure,
+            -- found_contaminated
+            (alf.contaminated AND alf.object_id_counts_first >= ?) AS found_contaminated
+        FROM all_linkages_flags AS alf
+        LEFT JOIN obs_partition_counts AS opc
+          ON alf.linked_object_id = opc.object_id
+        LEFT JOIN linkage_obs_partition_counts AS lopc
+          USING (linkage_id)
+        """,
+        [min_obs, min_obs],
+        ).arrow().read_all()
+
+    all_linkages = AllLinkages.from_kwargs(
+        linkage_id=all_linkages_arrow["linkage_id"],
+        partition_id=pa.repeat(partition_summary.id[0], len(all_linkages_arrow)),
+        linked_object_id=all_linkages_arrow["linked_object_id"],
+        num_obs=all_linkages_arrow["num_obs"],
+        num_obs_outside_partition=all_linkages_arrow["num_obs_outside_partition"],
+        num_members=all_linkages_arrow["num_members"],
+        pure=all_linkages_arrow["pure"],
+        pure_complete=pc.fill_null(all_linkages_arrow["pure_complete"], False),
+        contaminated=all_linkages_arrow["contaminated"],
+        contamination=all_linkages_arrow["contamination"],
+        mixed=all_linkages_arrow["mixed"],
+        found_pure=all_linkages_arrow["found_pure"],
+        found_contaminated=all_linkages_arrow["found_contaminated"],
+    )
+
+    # === Update AllObjects using the AllLinkages table ===
+    # Linkage member associations, including classification flags per linkage
+    conn.execute(
+        """
+        CREATE TEMP TABLE linkage_member_associations AS
+        SELECT
+            lma.linkage_id,
+            lma.obs_id,
+            lma.object_id,
+            al.linked_object_id,
+            al.pure,
+            al.pure_complete,
+            al.contaminated,
+            al.mixed
+        FROM lma
+        JOIN all_linkages_arrow AS al USING (linkage_id)
+        """
+    )
+
+    # Unique object members with classification flags
+    conn.execute(
+        """
+        CREATE TEMP TABLE unique_object_members_full AS
+        SELECT
+            linkage_id,
+            object_id,
+            COUNT(*) AS object_id_counts,
+            linked_object_id,
+            pure,
+            pure_complete,
+            contaminated,
+            mixed
+        FROM linkage_member_associations
+        GROUP BY linkage_id, object_id, linked_object_id, pure, pure_complete, contaminated, mixed
+        """
+    )
+
+    # Aggregate metrics per object_id
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_counts AS
+        SELECT
+            object_id,
+            SUM(CASE WHEN pure AND object_id = linked_object_id THEN 1 ELSE 0 END) AS pure,
+            SUM(CASE WHEN pure_complete AND object_id = linked_object_id THEN 1 ELSE 0 END) AS pure_complete,
+            SUM(CASE WHEN contaminated AND object_id = linked_object_id THEN 1 ELSE 0 END) AS contaminated
+        FROM unique_object_members_full
+        GROUP BY object_id
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_contaminant AS
+        SELECT
+            object_id,
+            COUNT(*) AS contaminant
+        FROM unique_object_members_full
+        WHERE contaminated AND object_id <> linked_object_id
+        GROUP BY object_id
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_mixed AS
+        SELECT
+            object_id,
+            COUNT(*) AS mixed
+        FROM unique_object_members_full
+        WHERE mixed
+        GROUP BY object_id
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_obs_in_pure AS
+        SELECT
+            object_id,
+            SUM(object_id_counts) AS obs_in_pure
+        FROM unique_object_members_full
+        WHERE pure
+        GROUP BY object_id
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_obs_in_pure_complete AS
+        SELECT
+            object_id,
+            SUM(object_id_counts) AS obs_in_pure_complete
+        FROM unique_object_members_full
+        WHERE pure_complete
+        GROUP BY object_id
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_obs_in_contaminated AS
+        SELECT
+            object_id,
+            SUM(object_id_counts) AS obs_in_contaminated
+        FROM unique_object_members_full
+        WHERE contaminated AND object_id = linked_object_id
+        GROUP BY object_id
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_obs_as_contaminant AS
+        SELECT
+            object_id,
+            SUM(object_id_counts) AS obs_as_contaminant
+        FROM unique_object_members_full
+        WHERE contaminated AND object_id <> linked_object_id
+        GROUP BY object_id
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_obs_in_mixed AS
+        SELECT
+            object_id,
+            SUM(object_id_counts) AS obs_in_mixed
+        FROM unique_object_members_full
+        WHERE mixed
+        GROUP BY object_id
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_found_pure AS
+        SELECT
+            object_id,
+            COUNT(DISTINCT linkage_id) AS found_pure
+        FROM unique_object_members_full
+        WHERE pure AND object_id_counts >= ?
+        GROUP BY object_id
+        """,
+        [min_obs],
+    )
+
+    conn.execute(
+        """
+        CREATE TEMP TABLE aol_found_contaminated AS
+        SELECT
+            object_id,
+            COUNT(DISTINCT linkage_id) AS found_contaminated
+        FROM unique_object_members_full
+        WHERE contaminated AND object_id_counts >= ?
+        GROUP BY object_id
+        """,
+        [min_obs],
+    )
+
+    # Register all_objects as a DuckDB table and join with aggregated linkage metrics
+    all_objects_table = all_objects.table
+    conn.register("all_objects", all_objects_table)
+
+    all_objects_updated_arrow = conn.execute(
+        """
+        SELECT
+            ao.object_id,
+            ao.partition_id,
+            ao.mjd_min,
+            ao.mjd_max,
+            ao.arc_length,
+            ao.num_obs,
+            ao.num_observatories,
+            ao.findable,
+            COALESCE(ac.pure, 0) AS pure,
+            COALESCE(ac.pure_complete, 0) AS pure_complete,
+            COALESCE(ac.contaminated, 0) AS contaminated,
+            COALESCE(acn.contaminant, 0) AS contaminant,
+            COALESCE(am.mixed, 0) AS mixed,
+            COALESCE(oip.obs_in_pure, 0) AS obs_in_pure,
+            COALESCE(oipc.obs_in_pure_complete, 0) AS obs_in_pure_complete,
+            COALESCE(oic.obs_in_contaminated, 0) AS obs_in_contaminated,
+            COALESCE(oac.obs_as_contaminant, 0) AS obs_as_contaminant,
+            COALESCE(oim.obs_in_mixed, 0) AS obs_in_mixed,
+            COALESCE(fp.found_pure, 0) AS found_pure,
+            COALESCE(fc.found_contaminated, 0) AS found_contaminated
+        FROM all_objects AS ao
+        LEFT JOIN aol_counts AS ac USING (object_id)
+        LEFT JOIN aol_contaminant AS acn USING (object_id)
+        LEFT JOIN aol_mixed AS am USING (object_id)
+        LEFT JOIN aol_obs_in_pure AS oip USING (object_id)
+        LEFT JOIN aol_obs_in_pure_complete AS oipc USING (object_id)
+        LEFT JOIN aol_obs_in_contaminated AS oic USING (object_id)
+        LEFT JOIN aol_obs_as_contaminant AS oac USING (object_id)
+        LEFT JOIN aol_obs_in_mixed AS oim USING (object_id)
+        LEFT JOIN aol_found_pure AS fp USING (object_id)
+        LEFT JOIN aol_found_contaminated AS fc USING (object_id)
+        """
+    ).arrow().read_all()
+
+    all_objects_updated = AllObjects.from_kwargs(
+        object_id=all_objects_updated_arrow["object_id"],
+        partition_id=all_objects_updated_arrow["partition_id"],
+        mjd_min=all_objects_updated_arrow["mjd_min"],
+        mjd_max=all_objects_updated_arrow["mjd_max"],
+        arc_length=all_objects_updated_arrow["arc_length"],
+        num_obs=all_objects_updated_arrow["num_obs"],
+        num_observatories=all_objects_updated_arrow["num_observatories"],
+        findable=all_objects_updated_arrow["findable"],
+        found_pure=all_objects_updated_arrow["found_pure"].cast(pa.int64()),
+        found_contaminated=all_objects_updated_arrow["found_contaminated"].cast(pa.int64()),
+        pure=all_objects_updated_arrow["pure"].cast(pa.int64()),
+        pure_complete=all_objects_updated_arrow["pure_complete"].cast(pa.int64()),
+        contaminated=all_objects_updated_arrow["contaminated"].cast(pa.int64()),
+        contaminant=all_objects_updated_arrow["contaminant"].cast(pa.int64()),
+        mixed=all_objects_updated_arrow["mixed"].cast(pa.int64()),
+        obs_in_pure=all_objects_updated_arrow["obs_in_pure"].cast(pa.int64()),
+        obs_in_pure_complete=all_objects_updated_arrow["obs_in_pure_complete"].cast(pa.int64()),
+        obs_in_contaminated=all_objects_updated_arrow["obs_in_contaminated"].cast(pa.int64()),
+        obs_as_contaminant=all_objects_updated_arrow["obs_as_contaminant"].cast(pa.int64()),
+        obs_in_mixed=all_objects_updated_arrow["obs_in_mixed"].cast(pa.int64()),
+    )
+
+    # === Update PartitionSummary ===
+    pure_known = len(
+        all_linkages.apply_mask(
+            pc.and_(
+                pc.equal(all_linkages.pure, True),
+                pc.invert(pc.is_null(all_linkages.linked_object_id)),
+            )
+        )
+    )
+    pure_unknown = len(
+        all_linkages.apply_mask(
+            pc.and_(
+                pc.equal(all_linkages.pure, True),
+                pc.is_null(all_linkages.linked_object_id),
+            )
+        )
+    )
+    contaminated_count = len(all_linkages.select("contaminated", True))
+    mixed_count = len(all_linkages.select("mixed", True))
+
+    found = len(
+        all_linkages.apply_mask(
+            pc.and_(
+                pc.equal(all_linkages.pure, True),
+                pc.invert(pc.is_null(all_linkages.linked_object_id)),
+            )
+        ).linked_object_id.unique()
+    )
+
+    findable_val = (
+        partition.findable[0].as_py() if not pc.is_null(partition.findable[0]).as_py() else 0
+    )
+    completeness = found / findable_val if findable_val and findable_val > 0 else float(found)
+    completeness *= 100
+
+    partition_summary_updated = PartitionSummary.from_kwargs(
+        id=partition.id,
+        start_night=partition.start_night,
+        end_night=partition.end_night,
+        observations=partition.observations,
+        findable=partition.findable,
+        found=[found],
+        completeness=[completeness],
+        pure_known=[pure_known],
+        pure_unknown=[pure_unknown],
+        contaminated=[contaminated_count],
+        mixed=[mixed_count],
+    )
+
+    return all_objects_updated, all_linkages, partition_summary_updated

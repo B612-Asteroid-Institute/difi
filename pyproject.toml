@@ -91,6 +91,10 @@ dev = [
     "adam-assist>=0.2.1",
 ]
 
+duckdb = [
+    "duckdb>=0.9.0",
+]
+
 [tool.black]
 line-length = 110
 
