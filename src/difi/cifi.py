@@ -114,7 +114,7 @@ class AllObjects(qv.Table):
 
 
 def analyze_observations(
-    observations: Union[Observations, str, Path],
+    observations,
     partitions: Optional[Partitions] = None,
     metric: Union[str, Metrics] = "singletons",
     by_object: bool = False,
@@ -159,15 +159,25 @@ def analyze_observations(
     """
 
     # Normalize engine
-    if engine not in {"auto", "memory", "duckdb"}:
-        raise ValueError(f"Unknown engine '{engine}', expected 'auto', 'memory', or 'duckdb'.")
+    if engine not in {"auto", "memory", "duckdb", "bigquery"}:
+        raise ValueError(
+            f"Unknown engine '{engine}', expected 'auto', 'memory', 'duckdb', or 'bigquery'."
+        )
 
-    # Determine if we were given a path or an in-memory table
+    # Determine if we were given a path, an in-memory table, or a BigQuery descriptor
     obs_is_table = isinstance(observations, Observations)
     obs_is_path = isinstance(observations, (str, Path))
+    obs_is_bq = hasattr(observations, "table")
 
     if engine == "auto":
-        engine = "memory" if obs_is_table else "duckdb" if obs_is_path else "memory"
+        if obs_is_table:
+            engine = "memory"
+        elif obs_is_path:
+            engine = "duckdb"
+        elif obs_is_bq:
+            engine = "bigquery"
+        else:
+            engine = "memory"
 
     # Resolve metric instance
     metric_func_mapper = {
@@ -184,6 +194,23 @@ def analyze_observations(
     else:
         raise ValueError("metric must be a string or a FindabilityMetric")
 
+    # BigQuery engine: Singletons over BigQuery without materializing raw observations.
+    if (
+        engine == "bigquery"
+        and obs_is_bq
+        and isinstance(metric_, SingletonMetric)
+        and partitions is None
+        and by_object
+    ):
+        from .bigquery_engine import analyze_observations_singletons_bigquery  # type: ignore[import]
+
+        all_objects, findable_observations_bq, partition_summary = analyze_observations_singletons_bigquery(
+            observations,
+            metric_,
+            max_processes=max_processes,
+        )
+        return all_objects, findable_observations_bq, partition_summary
+
     # DuckDB engine: support a streaming, on-disk implementation for the
     # SingletonMetric when given a Parquet path and no explicit partitions.
     if engine == "duckdb" and obs_is_path and isinstance(metric_, SingletonMetric) and partitions is None:
@@ -198,8 +225,11 @@ def analyze_observations(
         # observations is a path-like pointing to Parquet data
         observations = Observations.from_parquet(str(observations))
         obs_is_table = True
-
-    if not obs_is_table:
+    if engine == "bigquery" and not obs_is_bq:
+        raise TypeError(
+            "analyze_observations(engine='bigquery') expects a BigQueryObservationsInput-like descriptor."
+        )
+    if engine in {"memory", "duckdb"} and not obs_is_table:
         raise TypeError(
             "analyze_observations expected an Observations table or a path-like to Parquet data."
         )

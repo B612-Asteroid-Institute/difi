@@ -527,8 +527,8 @@ def update_all_objects(
 
 
 def analyze_linkages(
-    observations: Union[Observations, str, Path],
-    linkage_members: Union[LinkageMembers, str, Path, DuckDBLinkageInput],
+    observations,
+    linkage_members,
     all_objects: AllObjects,
     partition_summary: PartitionSummary | None = None,
     partition_mapping: PartitionMapping | None = None,
@@ -576,19 +576,26 @@ def analyze_linkages(
         Table of all linkages.
     """
 
-    if engine not in {"auto", "memory", "duckdb"}:
-        raise ValueError(f"Unknown engine '{engine}', expected 'auto', 'memory', or 'duckdb'.")
+    if engine not in {"auto", "memory", "duckdb", "bigquery"}:
+        raise ValueError(
+            f"Unknown engine '{engine}', expected 'auto', 'memory', 'duckdb', or 'bigquery'."
+        )
 
     obs_is_table = isinstance(observations, Observations)
     lm_is_table = isinstance(linkage_members, LinkageMembers)
     obs_is_path = isinstance(observations, (str, Path))
     lm_is_path = isinstance(linkage_members, (str, Path))
+    obs_is_bq = hasattr(observations, "table")
+    lm_is_bq = hasattr(linkage_members, "table")
 
     if engine == "auto":
         # If both inputs are in-memory tables, keep the original behavior.
-        # Otherwise, prefer the DuckDB-backed engine.
+        # Otherwise, prefer the DuckDB-backed engine for Parquet paths,
+        # and the BigQuery engine for BigQuery descriptors.
         if obs_is_table and lm_is_table:
             engine = "memory"
+        elif obs_is_bq and lm_is_bq:
+            engine = "bigquery"
         else:
             engine = "duckdb"
 
@@ -599,6 +606,23 @@ def analyze_linkages(
             all_objects,
             partition_summary=partition_summary,
             partition_mapping=partition_mapping,
+            min_obs=min_obs,
+            contamination_percentage=contamination_percentage,
+        )
+
+    if engine == "bigquery":
+        from .bigquery_engine import analyze_linkages_bigquery  # type: ignore[import]
+
+        if not (obs_is_bq and lm_is_bq):
+            raise TypeError(
+                "analyze_linkages(engine='bigquery') expects BigQueryObservationsInput- and "
+                "BigQueryLinkageInput-like descriptors."
+            )
+        return analyze_linkages_bigquery(
+            observations,
+            linkage_members,
+            all_objects,
+            partition_summary=partition_summary,
             min_obs=min_obs,
             contamination_percentage=contamination_percentage,
         )
