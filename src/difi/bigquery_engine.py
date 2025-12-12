@@ -195,7 +195,9 @@ def analyze_observations_singletons_bigquery(
         obs_in_mixed=pa.array([0] * len(per_obj_tbl), type=pa.int64()),
     )
 
-    findable_count = int(per_obj_tbl["findable"].cast(pa.int64()).sum().as_py())
+    # Sum the findable flag using pyarrow.compute on the ChunkedArray.
+    findable_scalar = pc.sum(per_obj_tbl["findable"].cast(pa.int64()))
+    findable_count = int(findable_scalar.as_py() or 0)
     partition_summary = PartitionSummary.from_kwargs(
         id=["0"],
         start_night=[min_night],
